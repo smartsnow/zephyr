@@ -6,6 +6,8 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+#include <stdlib.h>
+
 #include <zephyr/types.h>
 #include <stddef.h>
 #include <errno.h>
@@ -20,6 +22,10 @@
 #include <sys/byteorder.h>
 
 #include <drivers/uart.h>
+
+#include "ringbuf.h"
+
+#define BT_LE_CONN_PARAM_FAST BT_LE_CONN_PARAM(6, 6, 0, 400)
 
 #define BT_UUID_UART_VAL 0xFFF0
 #define BT_UUID_UART_RX_VAL 0xFFF1
@@ -39,21 +45,23 @@ static struct bt_uuid_16 uuid = BT_UUID_INIT_16(0);
 static struct bt_gatt_discover_params discover_params;
 static struct bt_gatt_subscribe_params subscribe_params;
 
+static uint16_t write_norsp_mtu;
+
 static const struct device *uart_dev;
+static ring_buffer_t uart_ring_buf;
 
 static uint8_t notify_func(struct bt_conn *conn,
 			   struct bt_gatt_subscribe_params *params,
-			   const void *data, uint16_t length)
+			   const void *att_buf, uint16_t length)
 {
-	if (!data) {
+	if (!att_buf) {
 		printk("[UNSUBSCRIBED]\n");
 		params->value_handle = 0U;
 		return BT_GATT_ITER_STOP;
 	}
 
-	for (int i = 0; i < length; i++)
-	{
-		uart_poll_out(uart_dev, ((uint8_t *)data)[i]);
+	for (int i = 0; i < length; i++) {
+		uart_poll_out(uart_dev, ((uint8_t *)att_buf)[i]);
 	}
 
 	return BT_GATT_ITER_CONTINUE;
@@ -79,14 +87,14 @@ static uint8_t discover_func(struct bt_conn *conn,
 		discover_params.start_handle = attr->handle + 1;
 		discover_params.type = BT_GATT_DISCOVER_CHARACTERISTIC;
 
-		printk("UART service start handle %u\n", discover_params.start_handle);
+		printk("UART service start handle %u\n",
+		       discover_params.start_handle);
 
 		err = bt_gatt_discover(conn, &discover_params);
 		if (err) {
 			printk("Discover failed (err %d)\n", err);
 		}
-	} else if (!bt_uuid_cmp(discover_params.uuid,
-				BT_UUID_UART_RX)) {
+	} else if (!bt_uuid_cmp(discover_params.uuid, BT_UUID_UART_RX)) {
 		memcpy(&uuid, BT_UUID_UART_TX, sizeof(uuid));
 		discover_params.uuid = &uuid.uuid;
 
@@ -98,15 +106,15 @@ static uint8_t discover_func(struct bt_conn *conn,
 		if (err) {
 			printk("Discover failed (err %d)\n", err);
 		}
-	} else if (!bt_uuid_cmp(discover_params.uuid,
-				BT_UUID_UART_TX)) {
+	} else if (!bt_uuid_cmp(discover_params.uuid, BT_UUID_UART_TX)) {
 		memcpy(&uuid, BT_UUID_GATT_CCC, sizeof(uuid));
 		discover_params.uuid = &uuid.uuid;
 		discover_params.start_handle = attr->handle + 2;
 		discover_params.type = BT_GATT_DISCOVER_DESCRIPTOR;
 		subscribe_params.value_handle = bt_gatt_attr_value_handle(attr);
 
-		printk("UART Tx value handle %u\n", subscribe_params.value_handle);
+		printk("UART Tx value handle %u\n",
+		       subscribe_params.value_handle);
 
 		err = bt_gatt_discover(conn, &discover_params);
 		if (err) {
@@ -124,6 +132,9 @@ static uint8_t discover_func(struct bt_conn *conn,
 			printk("Subscribe failed (err %d)\n", err);
 		} else {
 			printk("Listen on UART Tx notification\n");
+			uint8_t att_mtu = bt_gatt_get_mtu(conn);
+			printk("MTU %d\n", att_mtu);
+			write_norsp_mtu = att_mtu - 3;
 		}
 
 		return BT_GATT_ITER_STOP;
@@ -161,7 +172,7 @@ static void device_found(const bt_addr_le_t *addr, int8_t rssi, uint8_t type,
 	}
 
 	err = bt_conn_le_create(addr, BT_CONN_LE_CREATE_CONN,
-				BT_LE_CONN_PARAM_DEFAULT, &default_conn);
+				BT_LE_CONN_PARAM_FAST, &default_conn);
 	if (err) {
 		printk("Create conn to %s failed (%u)\n", addr_str, err);
 		start_scan();
@@ -173,12 +184,12 @@ static void start_scan(void)
 	int err;
 
 	/* Use active scanning and disable duplicate filtering to handle any
-	 * devices that might update their advertising data at runtime. */
+	 * devices that might update their advertising att_buf at runtime. */
 	struct bt_le_scan_param scan_param = {
-		.type       = BT_LE_SCAN_TYPE_ACTIVE,
-		.options    = BT_LE_SCAN_OPT_NONE,
-		.interval   = BT_GAP_SCAN_FAST_INTERVAL,
-		.window     = BT_GAP_SCAN_FAST_WINDOW,
+		.type = BT_LE_SCAN_TYPE_ACTIVE,
+		.options = BT_LE_SCAN_OPT_NONE,
+		.interval = BT_GAP_SCAN_FAST_INTERVAL,
+		.window = BT_GAP_SCAN_FAST_WINDOW,
 	};
 
 	err = bt_le_scan_start(&scan_param, device_found);
@@ -248,12 +259,33 @@ static struct bt_conn_cb conn_callbacks = {
 	.disconnected = disconnected,
 };
 
+static void cli_uart_flush(const struct device *dev)
+{
+	uint8_t c;
+	while (uart_fifo_read(dev, &c, 1) > 0) {
+		continue;
+	}
+}
+
+static void cli_uart_isr(const struct device *uart, void *user_data)
+{
+	uint8_t c;
+	int rx = 0;
+
+	/* get all of the data off UART as fast as we can */
+	while (uart_irq_update(uart) && uart_irq_rx_ready(uart)) {
+		rx = uart_fifo_read(uart, &c, sizeof(c));
+		if (rx <= 0) {
+			continue;
+		}
+
+		ring_buffer_write(&uart_ring_buf, &c, 1);
+	}
+}
+
 void main(void)
 {
-	unsigned char c;
-	int err;
-	err = bt_enable(NULL);
-
+	int err = bt_enable(NULL);
 	if (err) {
 		printk("Bluetooth init failed (err %d)\n", err);
 		return;
@@ -265,13 +297,31 @@ void main(void)
 
 	start_scan();
 
+	static uint8_t data_buffer[1024];
+	ring_buffer_init(&uart_ring_buf, data_buffer, sizeof(data_buffer));
+
 	uart_dev = device_get_binding(CONFIG_UART_CONSOLE_ON_DEV_NAME);
+	uart_irq_rx_disable(uart_dev);
+	uart_irq_tx_disable(uart_dev);
+	cli_uart_flush(uart_dev);
+	uart_irq_callback_set(uart_dev, cli_uart_isr);
+	uart_irq_rx_enable(uart_dev);
+
+	uint32_t read_len;
+	static uint8_t att_buf[512];
 	while (1) {
-		if (uart_poll_in(uart_dev, &c) == 0)
-		{
-			// uart_poll_out(uart_dev, c);
-			bt_gatt_write_without_response(default_conn, uart_rx_value_handle, &c, 1, false);
-		}
-		k_sleep(K_MSEC(1));
+		k_sleep(K_MSEC(10));
+
+		if (ring_buffer_used_space(&uart_ring_buf) == 0)
+			continue;
+
+		do {
+			ring_buffer_read(&uart_ring_buf, att_buf,
+					 write_norsp_mtu, &read_len);
+			bt_gatt_write_without_response(default_conn,
+						       uart_rx_value_handle,
+						       att_buf, read_len,
+						       false);
+		} while (write_norsp_mtu == read_len);
 	}
 }
