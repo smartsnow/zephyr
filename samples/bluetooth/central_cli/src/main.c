@@ -135,6 +135,12 @@ static uint8_t discover_func(struct bt_conn *conn,
 			uint8_t att_mtu = bt_gatt_get_mtu(conn);
 			printk("MTU %d\n", att_mtu);
 			write_norsp_mtu = att_mtu - 3;
+			printk("\r\n");
+			printk("+--------------------------------------------------------------+\r\n");
+			printk("|   Shell@GATT by Snow Yang built at "__DATE__" "__TIME__"      |\r\n");
+			printk("+--------------------------------------------------------------+\r\n");
+			uart_poll_out(uart_dev, '$');
+			uart_poll_out(uart_dev, ' ');
 		}
 
 		return BT_GATT_ITER_STOP;
