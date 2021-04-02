@@ -35,6 +35,11 @@
 #define BT_UUID_UART_RX BT_UUID_DECLARE_16(BT_UUID_UART_RX_VAL)
 #define BT_UUID_UART_TX BT_UUID_DECLARE_16(BT_UUID_UART_TX_VAL)
 
+typedef struct {
+	const bt_addr_le_t *addr;
+	int8_t rssi;
+} scan_data_t;
+
 static void start_scan(void);
 
 static struct bt_conn *default_conn;
@@ -125,17 +130,20 @@ static uint8_t discover_func(struct bt_conn *conn,
 		subscribe_params.value = BT_GATT_CCC_NOTIFY;
 		subscribe_params.ccc_handle = attr->handle;
 
-		printk("UART Tx CCC handle %u\r\n", subscribe_params.ccc_handle);
+		printk("UART Tx CCC handle %u\r\n",
+		       subscribe_params.ccc_handle);
 
 		err = bt_gatt_subscribe(conn, &subscribe_params);
 		if (err && err != -EALREADY) {
 			printk("Subscribe failed (err %d)\r\n", err);
 		} else {
 			printk("Listen on UART Tx notification\r\n");
-			printk("\r\n");
+			printk("\033[7m\r\n");
 			printk("+--------------------------------------------------------------+\r\n");
-			printk("|   Shell@GATT by Snow Yang built at "__DATE__" "__TIME__"      |\r\n");
+			printk("|   Shell@GATT by Snow Yang built at " __DATE__
+			       " " __TIME__ "      |\r\n");
 			printk("+--------------------------------------------------------------+\r\n");
+			printk("\033[0m\r\n");
 			uart_poll_out(uart_dev, '$');
 			uart_poll_out(uart_dev, ' ');
 		}
@@ -146,39 +154,80 @@ static uint8_t discover_func(struct bt_conn *conn,
 	return BT_GATT_ITER_STOP;
 }
 
+static bool eir_found(struct bt_data *data, void *user_data)
+{
+	scan_data_t *scan_data = user_data;
+	const bt_addr_le_t *addr = scan_data->addr;
+	int8_t rssi = scan_data->rssi;
+	int i;
+
+	switch (data->type) {
+	case BT_DATA_UUID16_SOME:
+	case BT_DATA_UUID16_ALL:
+		if (data->data_len % sizeof(uint16_t) != 0U) {
+			printk("AD malformed\r\n");
+			return true;
+		}
+
+		for (i = 0; i < data->data_len; i += sizeof(uint16_t)) {
+			struct bt_uuid *uuid;
+			uint16_t u16;
+			int err;
+
+			memcpy(&u16, &data->data[i], sizeof(u16));
+			uuid = BT_UUID_DECLARE_16(sys_le16_to_cpu(u16));
+			if (bt_uuid_cmp(uuid, BT_UUID_MESH_PROV) &&
+			    bt_uuid_cmp(uuid, BT_UUID_MESH_PROXY)) {
+				continue;
+			}
+
+			char addr_str[BT_ADDR_LE_STR_LEN];
+			bt_addr_le_to_str(addr, addr_str, sizeof(addr_str));
+			printk("Device found: %s (RSSI %d)\r\n", addr_str,
+			       rssi);
+
+			/* connect only to devices in close proximity */
+			if (rssi < -30) {
+				return true;
+			}
+
+			err = bt_le_scan_stop();
+			if (err) {
+				printk("Stop LE scan failed (err %d)\r\n", err);
+				continue;
+			}
+
+			printk("Connecting ...\r\n");
+			err = bt_conn_le_create(addr, BT_CONN_LE_CREATE_CONN,
+						BT_LE_CONN_PARAM_FAST,
+						&default_conn);
+			if (err) {
+				printk("Create conn failed (err %d)\r\n", err);
+				start_scan();
+			}
+
+			return false;
+		}
+	}
+
+	return true;
+}
+
 static void device_found(const bt_addr_le_t *addr, int8_t rssi, uint8_t type,
 			 struct net_buf_simple *ad)
 {
-	char addr_str[BT_ADDR_LE_STR_LEN];
-	int err;
-
 	if (default_conn) {
 		return;
 	}
 
 	/* We're only interested in connectable events */
-	if (type != BT_GAP_ADV_TYPE_ADV_IND &&
-	    type != BT_GAP_ADV_TYPE_ADV_DIRECT_IND) {
-		return;
-	}
-
-	bt_addr_le_to_str(addr, addr_str, sizeof(addr_str));
-	printk("Device found: %s (RSSI %d)\r\n", addr_str, rssi);
-
-	/* connect only to devices in close proximity */
-	if (rssi < -30) {
-		return;
-	}
-
-	if (bt_le_scan_stop()) {
-		return;
-	}
-
-	err = bt_conn_le_create(addr, BT_CONN_LE_CREATE_CONN,
-				BT_LE_CONN_PARAM_FAST, &default_conn);
-	if (err) {
-		printk("Create conn to %s failed (%u)\r\n", addr_str, err);
-		start_scan();
+	if (type == BT_GAP_ADV_TYPE_ADV_IND ||
+	    type == BT_GAP_ADV_TYPE_ADV_DIRECT_IND) {
+		scan_data_t scan_data = {
+			.addr = addr,
+			.rssi = rssi,
+		};
+		bt_data_parse(ad, eir_found, &scan_data);
 	}
 }
 
@@ -208,8 +257,7 @@ static void exchange_func(struct bt_conn *conn, uint8_t err,
 			  struct bt_gatt_exchange_params *params)
 {
 	printk("Exchange %s\r\n", err == 0U ? "successful" : "failed");
-	if (err == 0)
-	{
+	if (err == 0) {
 		uint8_t att_mtu = bt_gatt_get_mtu(conn);
 		write_norsp_mtu = att_mtu - 3;
 		printk("MTU %d\r\n", att_mtu);
@@ -229,8 +277,7 @@ static void exchange_func(struct bt_conn *conn, uint8_t err,
 	}
 }
 
-static struct bt_gatt_exchange_params exchange_params = 
-{
+static struct bt_gatt_exchange_params exchange_params = {
 	.func = exchange_func,
 };
 
